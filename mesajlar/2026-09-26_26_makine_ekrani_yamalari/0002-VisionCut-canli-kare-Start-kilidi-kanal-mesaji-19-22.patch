@@ -1,0 +1,413 @@
+From f285ab85f644b14a63ea617547524507b908896e Mon Sep 17 00:00:00 2001
+From: AI Agent <agent@operon.test>
+Date: Fri, 25 Sep 2026 23:00:03 +0300
+Subject: [PATCH 2/3] VisionCut canli kare + Start kilidi (kanal mesaji 19, 22
+ madde 8)
+
+Operator bu ekranda Start'a basarken VisionCut'in ekrani arkada kaliyordu;
+kesim cizgisinin kamera cercevesinde olup olmadigini kimse gormuyordu.
+
+- services/vision_feed.py: VisionCut'in yazdigi durum.json + kare.jpg'yi
+  okur (C:\ProgramData\operon_visioncut\canli, VISIONCUT_CANLI_DIR ile
+  degisir). Karar VisionCut'in; burada yalniz okunur. 2 s'den eski ya da
+  eksik dosya "izin yok".
+- ui/machine/machine_page.py: START satirinin ustunde canli kare ve gerekce;
+  START = PLC izni VE guncel veri VE VisionCut onayi. Onay yoksa gerekce
+  listesine [U12] Kamera: <neden>. Cevrimde U12 yok.
+- Yalniz bu ekrandaki START dugmesini tutar; paneldeki fiziksel START'i
+  kapsamaz. PLC'nin state 40 kamera kontrolu degismedi. PLC degisikligi yok.
+- tests: 7 yeni test; PLC kaynakli Uxx testleri onay veren sahte kamerayla.
+  390/390.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ services/vision_feed.py                  |  79 +++++++++++++++
+ tests/test_machine_page_warning_table.py |  10 +-
+ tests/test_vision_feed_start_lock.py     | 116 +++++++++++++++++++++++
+ ui/machine/machine_page.py               |  87 ++++++++++++++++-
+ 4 files changed, 288 insertions(+), 4 deletions(-)
+ create mode 100644 services/vision_feed.py
+ create mode 100644 tests/test_vision_feed_start_lock.py
+
+diff --git a/services/vision_feed.py b/services/vision_feed.py
+new file mode 100644
+index 0000000..cc48015
+--- /dev/null
++++ b/services/vision_feed.py
+@@ -0,0 +1,79 @@
++"""VisionCut'ın yayınladığı canlı kare ve Start kararı (kanal mesajı 19, 22 §8).
++
++VisionCut ayrı bir süreç (INTEGRATION.md, 2026-09-23 kararı). Operatör bu
++ekranda Start'a basarken VisionCut'ın ekranı arkada kalıyor; kesim çizgisinin
++kamera çerçevesinde olup olmadığını kimse görmüyordu. VisionCut artık iki dosya
++yazıyor ve her birini atomik olarak değiştiriyor:
++
++* ``kare.jpg``   -- 640 px genişliğinde kare; referans, ±çerçeve ve merkez
++  çizgisi VisionCut tarafından çizilmiş (çerçeve VisionCut'ın kendi hizalama
++  sınırı, burada yeniden hesaplanmaz);
++* ``durum.json`` -- ``baslat_izni`` (bool), ``neden`` (operatör metni),
++  ``sapma_mm``, ``cerceve_mm``, ``kesimde`` ve UTC ``zaman``.
++
++Bu modül yalnız okur ve yaşını ölçer. Karar VisionCut'ındır; bayat ya da eksik
++dosya "izin yok" demektir -- görüntü yoksa kilit açılmaz (mesaj 19 kararı).
++
++⚠️ Bu kilit yalnız bu ekrandaki START düğmesini tutar. Paneldeki fiziksel
++START'ı kapsamaz; PLC'nin state 40 kamera kontrolü her iki yolda da geçerli
++(mesaj 22 §8).
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import time
++from dataclasses import dataclass
++from datetime import datetime
++from pathlib import Path
++
++#: VisionCut'ın kurulu hâlde yazdığı klasör. Ortam değişkeniyle değiştirilebilir.
++DEFAULT_FOLDER = Path(os.environ.get(
++    "VISIONCUT_CANLI_DIR", r"C:\ProgramData\operon_visioncut\canli"))
++#: VisionCut kesim dışında saniyede 4, kesimde saniyede 1 yazar. 2 s sessizlik
++#: programın kapandığı ya da takıldığı anlamına gelir.
++MAX_AGE_S = 2.0
++
++
++@dataclass(frozen=True)
++class VisionFeedState:
++    fresh: bool              # durum dosyası var ve yeni
++    allowed: bool            # VisionCut Start'a izin veriyor VE dosya taze
++    reason: str              # operatöre gösterilecek metin
++    cutting: bool            # VisionCut kesimde diyor
++    picture: Path | None     # gösterilecek kare, yoksa None
++    picture_mtime: float     # kare değişti mi diye bakmak için
++
++
++class VisionFeedReader:
++    def __init__(self, folder: Path = DEFAULT_FOLDER, max_age_s: float = MAX_AGE_S,
++                 clock=time.time) -> None:
++        self._folder = Path(folder)
++        self._max_age_s = float(max_age_s)
++        self._clock = clock
++
++    def read(self) -> VisionFeedState:
++        state_path = self._folder / "durum.json"
++        picture_path = self._folder / "kare.jpg"
++        try:
++            state = json.loads(state_path.read_text(encoding="utf-8"))
++            stamp = datetime.fromisoformat(state["zaman"]).timestamp()
++        except (OSError, ValueError, KeyError, TypeError):
++            return VisionFeedState(False, False, "VisionCut görüntüsü yok "
++                                   "(program kapalı olabilir).", False, None, 0.0)
++        try:
++            picture_mtime = picture_path.stat().st_mtime
++            picture = picture_path
++        except OSError:
++            picture_mtime, picture = 0.0, None
++
++        age = self._clock() - stamp
++        if age > self._max_age_s:
++            return VisionFeedState(False, False, f"VisionCut yanıt vermiyor "
++                                   f"({age:.0f} s).", False, picture, picture_mtime)
++        allowed = bool(state.get("baslat_izni", False))
++        reason = str(state.get("neden") or ("Kamera onayı var." if allowed
++                                            else "Kamera onayı yok."))
++        return VisionFeedState(True, allowed, reason, bool(state.get("kesimde", False)),
++                               picture, picture_mtime)
+diff --git a/tests/test_machine_page_warning_table.py b/tests/test_machine_page_warning_table.py
+index 6aa5d70..9894b74 100644
+--- a/tests/test_machine_page_warning_table.py
++++ b/tests/test_machine_page_warning_table.py
+@@ -33,10 +33,18 @@ def _page(tmp_path) -> tuple[MachinePage, MachineService]:
+     cfg = tmp_path / "opcua.json"
+     cfg.write_text(json.dumps({"endpoint": "opc.tcp://192.168.0.2:4840", "nodes": {}}), encoding="utf-8")
+     svc = MachineService(config_path=cfg)
+-    page = MachinePage(svc)
++    # Bu testler PLC kaynaklı Uxx'leri sayar; VisionCut onayı (U12) ayrı,
++    # tests/test_vision_feed_start_lock.py'de.
++    page = MachinePage(svc, vision_feed=_AllowingFeed())
+     return page, svc
+ 
+ 
++class _AllowingFeed:
++    def read(self):
++        from services.vision_feed import VisionFeedState
++        return VisionFeedState(True, True, "test", False, None, 0.0)
++
++
+ def _emit(svc: MachineService, **overrides) -> None:
+     snap = svc._snapshot
+     for key, value in overrides.items():
+diff --git a/tests/test_vision_feed_start_lock.py b/tests/test_vision_feed_start_lock.py
+new file mode 100644
+index 0000000..fb139fc
+--- /dev/null
++++ b/tests/test_vision_feed_start_lock.py
+@@ -0,0 +1,116 @@
++"""VisionCut canlı kare + Start kilidi (kanal mesajı 19, 22 §8).
++
++Karar VisionCut'ın (durum.json: baslat_izni + neden); burada yalnız okunur.
++Bayat ya da eksik dosya "izin yok" demektir. Kilit yalnız bu ekrandaki START
++düğmesini tutar - paneldeki fiziksel START'ı kapsamaz.
++"""
++
++from __future__ import annotations
++
++import json
++import time
++from datetime import datetime, timezone
++
++from PySide6.QtWidgets import QApplication
++
++_app = QApplication.instance() or QApplication([])
++
++from services.machine_service import MachineService  # noqa: E402
++from services.vision_feed import VisionFeedReader, VisionFeedState  # noqa: E402
++from ui.machine.machine_page import MachinePage  # noqa: E402
++
++
++def _write(folder, allowed=True, reason="Kesim çizgisi çerçevede: +0.4 mm.", when=None):
++    folder.mkdir(parents=True, exist_ok=True)
++    stamp = (when or datetime.now(timezone.utc)).isoformat()
++    # The exact shape VisionCut writes (brode_vision_console/services/hmi_feed.py).
++    (folder / "durum.json").write_text(json.dumps({
++        "cerceve_mm": 10.0, "kesimde": False, "baslat_izni": allowed,
++        "neden": reason, "sapma_mm": 0.4, "zaman": stamp,
++        "kare_yazildi": True, "surum": 1}, ensure_ascii=False), encoding="utf-8")
++
++
++# -- reader -------------------------------------------------------------------
++
++def test_no_file_means_no_start(tmp_path):
++    state = VisionFeedReader(tmp_path / "yok").read()
++    assert not state.fresh and not state.allowed
++    assert "görüntüsü yok" in state.reason
++
++
++def test_a_fresh_verdict_is_passed_through(tmp_path):
++    _write(tmp_path, allowed=False, reason="Kesim çizgisi çerçevenin dışında: +12.0 mm")
++    state = VisionFeedReader(tmp_path).read()
++    assert state.fresh and not state.allowed
++    assert "dışında" in state.reason
++
++
++def test_a_stale_verdict_does_not_allow_start(tmp_path):
++    _write(tmp_path, allowed=True)
++    state = VisionFeedReader(tmp_path, clock=lambda: time.time() + 10.0).read()
++    assert not state.allowed
++    assert "yanıt vermiyor" in state.reason
++
++
++# -- page ---------------------------------------------------------------------
++
++class _Feed:
++    def __init__(self, allowed: bool, reason: str = "Kesim çizgisi bulunamadı."):
++        self.state = VisionFeedState(True, allowed, reason, False, None, 0.0)
++
++    def read(self):
++        return self.state
++
++
++def _page(tmp_path, feed):
++    cfg = tmp_path / "opcua.json"
++    cfg.write_text(json.dumps({"endpoint": "opc.tcp://127.0.0.1:4840", "nodes": {}}),
++                   encoding="utf-8")
++    svc = MachineService(config_path=cfg)
++    return MachinePage(svc, vision_feed=feed), svc
++
++
++def _emit(page, svc, **overrides):
++    snap = svc._snapshot
++    values = {"stale": False, "start_permitted": True, "cycle_active": False}
++    values.update(overrides)
++    for key, value in values.items():
++        setattr(snap, key, value)
++    svc.snapshotUpdated.emit(snap)
++    _app.processEvents()
++
++
++def test_start_needs_the_camera_as_well_as_the_plc(tmp_path):
++    feed = _Feed(allowed=True)
++    page, svc = _page(tmp_path, feed)
++    _emit(page, svc)
++    assert page._start_btn.isEnabled()
++
++    feed.state = VisionFeedState(True, False, "Kesim çizgisi bulunamadı.", False, None, 0.0)
++    page._poll_vision_feed()
++    assert not page._start_btn.isEnabled(), "kamera onayı yokken START açık kaldı"
++
++    _emit(page, svc)
++    assert any(r.startswith("[U12] Kamera: Kesim çizgisi bulunamadı")
++               for r in page._live_warning_messages)
++
++
++def test_the_camera_never_opens_what_the_plc_holds(tmp_path):
++    page, svc = _page(tmp_path, _Feed(allowed=True))
++    _emit(page, svc, start_permitted=False)
++    assert not page._start_btn.isEnabled()
++
++
++def test_no_camera_reason_during_the_cycle(tmp_path):
++    page, svc = _page(tmp_path, _Feed(allowed=False))
++    _emit(page, svc, cycle_active=True, start_permitted=False)
++    assert not any(r.startswith("[U12]") for r in page._live_warning_messages)
++
++
++def test_the_page_reads_a_real_file_pair(tmp_path):
++    folder = tmp_path / "canli"
++    _write(folder, allowed=True)
++    page, svc = _page(tmp_path, VisionFeedReader(folder))
++    _emit(page, svc)
++    assert page._start_btn.isEnabled()
++    assert "çerçevede" in page._vision_reason.text()
+diff --git a/ui/machine/machine_page.py b/ui/machine/machine_page.py
+index 39bea32..f06fb57 100644
+--- a/ui/machine/machine_page.py
++++ b/ui/machine/machine_page.py
+@@ -3,7 +3,8 @@
+ 
+ from __future__ import annotations
+ 
+-from PySide6.QtGui import QColor
++from PySide6.QtCore import Qt, QTimer
++from PySide6.QtGui import QColor, QPixmap
+ from PySide6.QtWidgets import (
+     QCheckBox,
+     QFrame,
+@@ -27,6 +28,7 @@ from persistence.alarms import (
+     AlarmEvent,
+ )
+ from services.machine_service import MachineService
++from services.vision_feed import VisionFeedReader, VisionFeedState
+ from ui.machine.theme import COLORS, base_font
+ from ui.machine.widgets import ProcessStatusCard, Readout, touch_button
+ 
+@@ -177,9 +179,16 @@ def compute_active_state_message(snap: MachineSnapshot) -> str | None:
+ 
+ 
+ class MachinePage(QWidget):
+-    def __init__(self, service: MachineService, parent: QWidget | None = None):
++    def __init__(self, service: MachineService, parent: QWidget | None = None,
++                 vision_feed: VisionFeedReader | None = None):
+         super().__init__(parent)
+         self._service = service
++        # VisionCut canlı kare + Start kararı (kanal mesajı 19, 22 §8). Karar
++        # VisionCut'ın; burada yalnız okunur ve Start'a eklenir.
++        self._vision_feed = vision_feed or VisionFeedReader()
++        self._vision_state: VisionFeedState | None = None
++        self._picture_mtime = -1.0
++        self._last_snap: MachineSnapshot | None = None
+         # U01-U11 (Start engelleri) - kullanıcı isteği (2026-09-22): "tabloda
+         # yazılsın ama banner gibi kalıcı olmasın... resete bağlı değil, şu
+         # an hangi mantıkla çalışıyorsa tablonun içinde de o mantıkla
+@@ -195,6 +204,12 @@ class MachinePage(QWidget):
+         self._move_to_start_was_done = False
+         self._build_ui()
+ 
++        self._vision_timer = QTimer(self)
++        self._vision_timer.setInterval(250)
++        self._vision_timer.timeout.connect(self._poll_vision_feed)
++        self._vision_timer.start()
++        self._poll_vision_feed()
++
+         service.snapshotUpdated.connect(self._on_snapshot)
+         service.alarmsChanged.connect(self._refresh_alarm_table)
+         self._refresh_alarm_table()
+@@ -237,6 +252,23 @@ class MachinePage(QWidget):
+             process_row.addWidget(card)
+         root.addLayout(process_row)
+ 
++        # VisionCut canlı kare: operatör Start'a basmadan önce kesim çizgisinin
++        # kamera çerçevesinde olduğunu görsün (mesaj 19). Çerçeve ve çizgiler
++        # VisionCut tarafından çizilmiş gelir.
++        vision_row = QHBoxLayout()
++        vision_row.setSpacing(10)
++        self._vision_picture = QLabel("VisionCut görüntüsü yok")
++        self._vision_picture.setAlignment(Qt.AlignmentFlag.AlignCenter)
++        self._vision_picture.setFixedSize(300, 229)
++        self._vision_picture.setStyleSheet(
++            f"background-color: #000000; color: {COLORS['text_secondary']};")
++        self._vision_reason = QLabel("")
++        self._vision_reason.setWordWrap(True)
++        self._vision_reason.setFont(base_font(12, bold=True))
++        vision_row.addWidget(self._vision_picture)
++        vision_row.addWidget(self._vision_reason, stretch=1)
++        root.addLayout(vision_row)
++
+         command_row = QHBoxLayout()
+         command_row.setSpacing(10)
+         self._start_btn = touch_button("START", object_name="startButton", primary=True)
+@@ -263,6 +295,51 @@ class MachinePage(QWidget):
+         # görünsün.
+         root.addWidget(self._build_alarm_panel(), stretch=1)
+ 
++    # -- VisionCut canlı kare ------------------------------------------------
++
++    def _vision_start_reason(self, snap: MachineSnapshot) -> str | None:
++        """[U12] - VisionCut Start'a izin vermiyorsa nedeni. Çevrimde yok."""
++        if snap.cycle_active:
++            return None
++        state = self._vision_state
++        if state is not None and state.allowed:
++            return None
++        reason = state.reason if state is not None else "VisionCut görüntüsü yok."
++        return f"[U12] Kamera: {reason}"
++
++    def _apply_start_enable(self) -> None:
++        """START = PLC izni VE güncel veri VE VisionCut onayı.
++
++        Yalnız bu ekrandaki düğmeyi tutar; paneldeki fiziksel START'ı
++        kapsamaz. PLC'nin state 40 kamera kontrolü her iki yolda da geçerli.
++        """
++        snap = self._last_snap
++        if snap is None:
++            return
++        vision_ok = self._vision_state is not None and self._vision_state.allowed
++        self._start_btn.setEnabled(snap.start_permitted and not snap.stale and vision_ok)
++
++    def _poll_vision_feed(self) -> None:
++        state = self._vision_feed.read()
++        self._vision_state = state
++        if state.picture is not None and state.picture_mtime != self._picture_mtime:
++            pixmap = QPixmap(str(state.picture))
++            if not pixmap.isNull():
++                self._picture_mtime = state.picture_mtime
++                self._vision_picture.setPixmap(pixmap.scaled(
++                    self._vision_picture.size(), Qt.AspectRatioMode.KeepAspectRatio,
++                    Qt.TransformationMode.SmoothTransformation))
++        elif state.picture is None and self._picture_mtime != -1.0:
++            self._picture_mtime = -1.0
++            self._vision_picture.clear()
++            self._vision_picture.setText("VisionCut görüntüsü yok")
++        colour = COLORS["success"] if state.allowed else COLORS["warning"]
++        text = ("Kamera: " + state.reason) if not state.cutting else "Kamera: kesim sürüyor."
++        if self._vision_reason.text() != text:
++            self._vision_reason.setText(text)
++            self._vision_reason.setStyleSheet(f"color: {colour};")
++        self._apply_start_enable()
++
+     def _build_alarm_panel(self) -> QFrame:
+         """Alarm/Uyarı/Mesaj panosu (kullanıcı isteği, 2026-09-18): H4'ün
+         (merkezi alarm ekranı) PLC C2 sözleşmesini beklemeyen kısmı - ekran
+@@ -369,13 +446,17 @@ class MachinePage(QWidget):
+             "ok" if snap.feed_manual_allowed else "inactive",
+         )
+ 
+-        self._start_btn.setEnabled(snap.start_permitted and not stale)
++        self._last_snap = snap
++        self._apply_start_enable()
+ 
+         reasons = compute_start_inhibit_reasons(
+             snap,
+             self._service.get_parameter_value("lr_x_cut_start_pos"),
+             self._service.get_parameter_value("lr_y_center_position"),
+         )
++        vision_reason = self._vision_start_reason(snap)
++        if vision_reason is not None:
++            reasons = [*reasons, vision_reason]
+         if reasons:
+             self._start_inhibit_label.setText("Start engelli: " + " ".join(reasons))
+             self._start_inhibit_label.setVisible(True)
+-- 
+2.53.0.windows.1
+

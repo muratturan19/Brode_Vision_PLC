@@ -1,0 +1,896 @@
+From 3d42e626638df6771e22f46b7b3662b4639654c7 Mon Sep 17 00:00:00 2001
+From: Kolektif360 / VisionCut <muratturan19@gmail.com>
+Date: Thu, 24 Sep 2026 14:20:34 +0300
+Subject: [PATCH 1/3] VisionCut yamasi: paketlenince cikan dort kusur (mesaj
+ 08)
+
+a) config/opcua.json yoksa TagMapError -> demo mod. Var ama bozuksa hala hata.
+b) config/data yollari __file__ yerine paketlenmis calismada %ProgramData%.
+c) Yer tutucu kamera sayfasi kaldirildi; program machine_main ile aciliyor.
+d) KAMERA EKRANI sayfa degistirmiyor; VisionCut exe'sini one aliyor/baslatiyor,
+   sonra kendini kuculuyor. Yol: OpcUaConfig.vision_exe. Tek ornek korumasi.
+
+Yeni: app/paths.py, app/companion.py, tests/test_panel_companion.py,
+tests/test_writable_paths.py. test_missing_file_raises bilerek degistirildi.
+---
+ MakineEkrani.spec             |  64 +++++++++++++
+ app/companion.py              | 172 ++++++++++++++++++++++++++++++++++
+ app/main.py                   |  94 ++++++++++---------
+ app/paths.py                  |  57 +++++++++++
+ persistence/db.py             |  10 +-
+ plc/models.py                 |   4 +
+ plc/tag_map.py                |  21 ++++-
+ services/machine_service.py   |  10 ++
+ tests/test_panel_companion.py | 157 +++++++++++++++++++++++++++++++
+ tests/test_tag_map.py         |  25 ++++-
+ tests/test_writable_paths.py  |  73 +++++++++++++++
+ 11 files changed, 632 insertions(+), 55 deletions(-)
+ create mode 100644 MakineEkrani.spec
+ create mode 100644 app/companion.py
+ create mode 100644 app/paths.py
+ create mode 100644 tests/test_panel_companion.py
+ create mode 100644 tests/test_writable_paths.py
+
+diff --git a/MakineEkrani.spec b/MakineEkrani.spec
+new file mode 100644
+index 0000000..35effe8
+--- /dev/null
++++ b/MakineEkrani.spec
+@@ -0,0 +1,64 @@
++# -*- mode: python ; coding: utf-8 -*-
++"""Tek klasorluk Windows paketi:  python -m PyInstaller --noconfirm --clean MakineEkrani.spec
++
++Neden boyle:
++
++* `sqlalchemy.dialects.sqlite` gizli import -- SQLAlchemy lehceyi calisma
++  aninda, isimle yukler; PyInstaller'in statik analizi bunu goremez ve paket
++  ilk veritabani erisiminde patlar.
++* `collect_submodules('asyncua')` -- asyncua da kendi modullerini isimle
++  cozuyor (ua tipleri, sunucu/istemci alt paketleri).
++* `--add-data config;config` YOK, bilerek. Pakete gomulen bir yapilandirma,
++  musterinin degistiremeyecegi bir yapilandirma olurdu; paketlenmis calisma
++  `%ProgramData%\Bufera\MakineEkrani\config` altindan okuyor (app/paths.py).
++
++Derledikten sonra exe'yi BOS BIR YAPILANDIRMAYLA bir kez calistirin -- temiz
++bir makinede ilk acilis, yalnizca paketlenince gorunen kusurlarin cikti yer.
++"""
++from PyInstaller.utils.hooks import collect_submodules
++
++hiddenimports = ['sqlalchemy.dialects.sqlite']
++hiddenimports += collect_submodules('asyncua')
++
++
++a = Analysis(
++    ['app\\main.py'],
++    pathex=['.'],
++    binaries=[],
++    datas=[],
++    hiddenimports=hiddenimports,
++    hookspath=[],
++    hooksconfig={},
++    runtime_hooks=[],
++    excludes=[],
++    noarchive=False,
++    optimize=0,
++)
++pyz = PYZ(a.pure)
++
++exe = EXE(
++    pyz,
++    a.scripts,
++    [],
++    exclude_binaries=True,
++    name='MakineEkrani',
++    debug=False,
++    bootloader_ignore_signals=False,
++    strip=False,
++    upx=True,
++    console=False,
++    disable_windowed_traceback=False,
++    argv_emulation=False,
++    target_arch=None,
++    codesign_identity=None,
++    entitlements_file=None,
++)
++coll = COLLECT(
++    exe,
++    a.binaries,
++    a.datas,
++    strip=False,
++    upx=True,
++    upx_exclude=[],
++    name='MakineEkrani',
++)
+diff --git a/app/companion.py b/app/companion.py
+new file mode 100644
+index 0000000..4ea9c63
+--- /dev/null
++++ b/app/companion.py
+@@ -0,0 +1,172 @@
++"""The other program on the same panel.
++
++Two applications share the machine PC: this one and Operon VisionCut. They
++were going to be one process; that was refused for a measured reason (VisionCut
++message 07: a single plot removed from their process took vision from 26.9 to
++35.1 fps, and their accuracy is made of frame rate). KARARLAR.md #1 records the
++decision: separate processes, separate full-screen windows, and the switch
++between them is a desktop problem rather than a protocol one.
++
++Two rules make that survivable on a kiosk with no taskbar:
++
++  * **Launch or raise, never just show.** An operator can close a window. A
++    button that only raised an existing window would leave the other program
++    gone until somebody found a keyboard. Starting it when it is missing makes
++    the pair self-healing.
++  * **One instance each.** A second copy of this program would open a second
++    OPC UA session and write the same tags. The second launch raises the first
++    window and exits.
++
++Windows only. Everything degrades to "do nothing and say so" elsewhere, so a
++Linux or macOS development box still runs.
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++log = logging.getLogger(__name__)
++
++#: Substring matched against window titles when looking for VisionCut. Their
++#: title is "Operon VisionCut v1.0.0-rc.23 (faz1-5)"; the product name is what
++#: survives their version bumps, and they have undertaken not to change it
++#: (VisionCut message 08, "Tek ricamız: pencere başlığı").
++VISION_TITLE_HINT = "Operon VisionCut"
++
++#: Our own title must keep containing "Makine Ekran" for the same reason, in
++#: the other direction. See app/main.py.
++OWN_TITLE_HINT = "Makine Ekran"
++
++#: Named mutex for the single-instance check.
++SINGLE_INSTANCE_NAME = "Local\\BuferaMakineEkrani.single"
++
++_IS_WINDOWS = sys.platform.startswith("win")
++
++
++def _find_window(title_hint: str) -> int | None:
++    """Handle of the first visible top-level window whose title matches."""
++    if not _IS_WINDOWS or not title_hint:
++        return None
++    import ctypes
++    from ctypes import wintypes
++
++    user32 = ctypes.windll.user32
++    found: list[int] = []
++    needle = title_hint.casefold()
++
++    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
++    def _visit(hwnd, _lparam):  # type: ignore[no-untyped-def]
++        if not user32.IsWindowVisible(hwnd):
++            return True
++        length = user32.GetWindowTextLengthW(hwnd)
++        if length <= 0:
++            return True
++        buffer = ctypes.create_unicode_buffer(length + 1)
++        user32.GetWindowTextW(hwnd, buffer, length + 1)
++        if needle in buffer.value.casefold():
++            found.append(int(hwnd))
++            return False
++        return True
++
++    user32.EnumWindows(_visit, 0)
++    return found[0] if found else None
++
++
++def _bring_to_front(hwnd: int) -> None:
++    """Restore if minimised, then ask for the foreground.
++
++    ⚠️ The request can be refused. Windows grants the foreground only to a
++    process that already owns it or was given it, which is why the program
++    HANDING OVER minimises itself -- that is what actually puts the other one
++    in front. This call is the polite half, not the load-bearing one.
++    """
++    if not _IS_WINDOWS:
++        return
++    import ctypes
++
++    user32 = ctypes.windll.user32
++    if user32.IsIconic(hwnd):
++        user32.ShowWindow(hwnd, 9)       # SW_RESTORE
++    user32.SetForegroundWindow(hwnd)
++
++
++def show_vision_screen(exe_path: str | os.PathLike[str] | None,
++                       title_hint: str = VISION_TITLE_HINT) -> str:
++    """Bring VisionCut forward, starting it if it is not running.
++
++    Returns what happened, for the log and for tests: ``"raised"``,
++    ``"launched"``, ``"missing"`` (no path configured or file not found) or
++    ``"failed"``.
++    """
++    hwnd = _find_window(title_hint)
++    if hwnd is not None:
++        _bring_to_front(hwnd)
++        log.info("Kamera ekranı öne alındı")
++        return "raised"
++
++    if not exe_path:
++        log.warning("Kamera ekranı çalışmıyor ve yolu tanımlı değil "
++                    "(config/opcua.json içinde vision_exe)")
++        return "missing"
++
++    target = Path(exe_path)
++    if not target.is_file():
++        log.warning("Kamera ekranı bulunamadı: %s", target)
++        return "missing"
++
++    try:
++        # Detached: VisionCut must outlive this process. As a child, closing
++        # the machine screen would take the operator's camera screen with it.
++        flags = 0
++        if _IS_WINDOWS:
++            flags = subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000008  # DETACHED
++        subprocess.Popen([str(target)], cwd=str(target.parent),
++                         creationflags=flags, close_fds=True)
++    except OSError:
++        log.exception("Kamera ekranı başlatılamadı: %s", target)
++        return "failed"
++
++    log.info("Kamera ekranı başlatıldı: %s", target)
++    return "launched"
++
++
++class SingleInstance:
++    """A named mutex that says whether this process is the first copy.
++
++    Held for the life of the process; Windows releases it when the process
++    dies, including a crash, so a stale lock cannot strand the panel.
++    """
++
++    def __init__(self, name: str = SINGLE_INSTANCE_NAME) -> None:
++        self._name = name
++        self._handle = None
++        self.is_first = True
++        if not _IS_WINDOWS:
++            return
++        import ctypes
++
++        kernel32 = ctypes.windll.kernel32
++        self._handle = kernel32.CreateMutexW(None, False, name)
++        # 183 = ERROR_ALREADY_EXISTS. The mutex is opened either way, so the
++        # handle is valid; only the error code distinguishes the two cases.
++        self.is_first = kernel32.GetLastError() != 183
++
++    def release(self) -> None:
++        if self._handle and _IS_WINDOWS:
++            import ctypes
++
++            ctypes.windll.kernel32.CloseHandle(self._handle)
++            self._handle = None
++
++
++def raise_existing_instance(title_hint: str = OWN_TITLE_HINT) -> bool:
++    """Put an already running copy of THIS program in front. True if found."""
++    hwnd = _find_window(title_hint)
++    if hwnd is None:
++        return False
++    _bring_to_front(hwnd)
++    return True
+diff --git a/app/main.py b/app/main.py
+index 21f5c96..872893a 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -1,11 +1,14 @@
+-"""Standalone development/demo host shell.
+-
+-This is NOT the real VisionCut application — VisionCut belongs to another
+-company and its source is not available to us (see INTEGRATION.md). This
+-shell exists only so the Makine Ekranı can be built, run and demoed without
+-it: a placeholder "Kamera Ekranı" page stands in for VisionCut's real camera
+-UI, with a single "Makine Ekranı" button, matching the navigation contract
+-described in the integration brief (section 5 & 29).
++"""Makine Ekranı — application entry point.
++
++VisionCut is a SEPARATE PROGRAM in a separate process (KARARLAR.md #1), not a
++page inside this one. The placeholder "Kamera Ekranı" page that used to stand
++in for it is gone: in a two-process panel there is nothing for it to stand in
++for, and a fake camera screen beside a real one is the kind of placeholder
++that lights a green light nobody earned.
++
++"KAMERA EKRANI" therefore hands the panel over instead of switching pages —
++see `app/companion.py` for why it launches as well as raises, and why this
++window minimises itself on the way out.
+ """
+ 
+ from __future__ import annotations
+@@ -13,8 +16,10 @@ from __future__ import annotations
+ import logging
+ import sys
+ 
+-from PySide6.QtCore import Qt, Signal
+-from PySide6.QtWidgets import QApplication, QLabel, QMainWindow, QPushButton, QStackedWidget, QVBoxLayout, QWidget
++from PySide6.QtCore import Qt
++from PySide6.QtWidgets import QApplication, QMainWindow, QStackedWidget, QVBoxLayout, QWidget
++
++from app.companion import SingleInstance, raise_existing_instance, show_vision_screen
+ 
+ from persistence.db import init_engine
+ from services.machine_service import MachineService
+@@ -26,34 +31,6 @@ from ui.machine.theme import STYLESHEET
+ from ui.machine.widgets import MachineStatusBar, SectionTabs
+ 
+ 
+-class CameraPlaceholderPage(QWidget):
+-    """Stand-in for VisionCut's real camera screen (not ours to build)."""
+-
+-    navigateRequested = Signal(str)  # "machine_main"
+-
+-    def __init__(self, parent: QWidget | None = None):
+-        super().__init__(parent)
+-        layout = QVBoxLayout(self)
+-        layout.setAlignment(layout.alignment())
+-        title = QLabel("VisionCut — Kamera Ekranı (yer tutucu)")
+-        title.setStyleSheet("font-size: 18px; font-weight: 600;")
+-        subtitle = QLabel(
+-            "Gerçek VisionCut uygulaması bu makinede mevcut değil.\n"
+-            "Bu ekran yalnızca geliştirme/test amaçlı bir yer tutucudur."
+-        )
+-        subtitle.setStyleSheet("color: #9FADC4;")
+-        button = QPushButton("Makine Ekranı")
+-        button.setObjectName("cameraButton")
+-        button.setMinimumHeight(64)
+-        button.clicked.connect(lambda: self.navigateRequested.emit("machine_main"))
+-
+-        layout.addStretch(1)
+-        layout.addWidget(title)
+-        layout.addWidget(subtitle)
+-        layout.addWidget(button)
+-        layout.addStretch(1)
+-
+-
+ class MainWindow(QMainWindow):
+     def __init__(self, service: MachineService):
+         super().__init__()
+@@ -102,14 +79,13 @@ class MainWindow(QMainWindow):
+ 
+         self.setCentralWidget(central)
+ 
+-        self._camera_page = CameraPlaceholderPage()
+         self._machine_page = MachinePage(service)
+         self._manual_page = ManualPage(service)
+         self._settings_page = SettingsPage(service)
+         self._alarm_page = AlarmPage(service)
+ 
++        # "camera" is deliberately absent: it is an action, not a page.
+         self._pages = {
+-            "camera": self._camera_page,
+             "machine_main": self._machine_page,
+             "manual": self._manual_page,
+             "settings": self._settings_page,
+@@ -118,14 +94,33 @@ class MainWindow(QMainWindow):
+         for page in self._pages.values():
+             self._stack.addWidget(page)
+ 
+-        self._camera_page.navigateRequested.connect(self._navigate)
+-
+-        self._navigate("camera")
++        # Opens on the machine's own main page. It used to open on the
++        # placeholder camera page, which in a two-process panel showed the
++        # operator a fake version of a program running next door.
++        self._navigate("machine_main")
+ 
+     def _navigate(self, key: str) -> None:
++        if key == "camera":
++            self._hand_over_to_vision()
++            return
+         self._stack.setCurrentWidget(self._pages[key])
+         self._nav.set_active(key)
+ 
++    def _hand_over_to_vision(self) -> str:
++        """Put VisionCut in front of the operator and step aside.
++
++        ⚠️ The order matters. Windows will usually refuse SetForegroundWindow
++        to a process that does not own the foreground, so raising VisionCut is
++        only a request; minimising OURSELVES is what actually reveals it. We
++        minimise only when there is something to reveal -- if VisionCut is not
++        installed, stepping aside would leave the operator looking at the
++        desktop with no way back on a kiosk with no taskbar.
++        """
++        outcome = show_vision_screen(self._service.config.vision_exe)
++        if outcome in ("raised", "launched"):
++            self.showMinimized()
++        return outcome
++
+     def closeEvent(self, event) -> None:  # noqa: N802 (Qt override)
+         self._service.shutdown()
+         super().closeEvent(event)
+@@ -147,6 +142,14 @@ def main() -> int:
+     # Qt topluluğunda standart düzeltmedir.
+     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+ 
++    # One copy only: a second would open a second OPC UA session and write
++    # the same tags. The second launch raises the first window and exits.
++    instance = SingleInstance()
++    if not instance.is_first:
++        logging.warning("Makine Ekranı zaten çalışıyor; var olan pencere öne alındı.")
++        raise_existing_instance()
++        return 0
++
+     app = QApplication(sys.argv)
+     app.setStyleSheet(STYLESHEET)
+ 
+@@ -160,7 +163,10 @@ def main() -> int:
+     # snapshotUpdated emissions (e.g. entering Demo mode) aren't missed.
+     service.start()
+ 
+-    return app.exec()
++    try:
++        return app.exec()
++    finally:
++        instance.release()
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/app/paths.py b/app/paths.py
+new file mode 100644
+index 0000000..3554461
+--- /dev/null
++++ b/app/paths.py
+@@ -0,0 +1,57 @@
++"""Where the program keeps config and data, in development and once frozen.
++
++Until now both locations were derived from ``__file__``. That is correct
++while the program runs from a checkout, and wrong the moment it is packaged:
++``__file__`` then points inside the one-folder bundle, and a bundle installed
++under ``Program Files`` is not writable. Alarm history and the settings store
++would fail on the customer's panel while working perfectly on every
++development machine -- a defect that only a packaged run can show.
++
++So: frozen runs keep their writable state under ``%ProgramData%``, checkouts
++keep using the repository folders, and both can be overridden with an
++environment variable for tests and for unusual installs.
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++from pathlib import Path
++
++#: Repository root (this file lives in ``app/``).
++_REPO_ROOT = Path(__file__).resolve().parent.parent
++
++#: Vendor/product folder under %ProgramData%. Matches the installer layout.
++_PROGRAMDATA_SUBDIR = Path("Bufera") / "MakineEkrani"
++
++
++def is_frozen() -> bool:
++    """True when running from a PyInstaller bundle."""
++    return getattr(sys, "frozen", False)
++
++
++def _programdata_root() -> Path:
++    base = os.environ.get("ProgramData") or os.environ.get("ALLUSERSPROFILE")
++    if base:
++        return Path(base) / _PROGRAMDATA_SUBDIR
++    # Non-Windows development box: keep everything beside the repository.
++    return _REPO_ROOT
++
++
++def _resolve(env_var: str, folder: str) -> Path:
++    override = os.environ.get(env_var)
++    if override:
++        return Path(override)
++    if is_frozen():
++        return _programdata_root() / folder
++    return _REPO_ROOT / folder
++
++
++def config_dir() -> Path:
++    """Folder holding ``opcua.json``. Override: ``BUFERA_CONFIG_DIR``."""
++    return _resolve("BUFERA_CONFIG_DIR", "config")
++
++
++def data_dir() -> Path:
++    """Folder holding the SQLite database. Override: ``BUFERA_DATA_DIR``."""
++    return _resolve("BUFERA_DATA_DIR", "data")
+diff --git a/persistence/db.py b/persistence/db.py
+index 5059da1..18df464 100644
+--- a/persistence/db.py
++++ b/persistence/db.py
+@@ -9,10 +9,12 @@ from pathlib import Path
+ from sqlalchemy import create_engine
+ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+ 
+-from core.app_paths import app_base_dir
++from app.paths import data_dir
+ 
+-DATA_DIR = app_base_dir() / "data"
+-DEFAULT_DB_PATH = DATA_DIR / "bufera.db"
++
++def default_db_path() -> Path:
++    """Where the alarm history lives. Writable in a frozen install too."""
++    return data_dir() / "bufera.db"
+ 
+ 
+ class Base(DeclarativeBase):
+@@ -25,7 +27,7 @@ _SessionFactory: sessionmaker[Session] | None = None
+ 
+ def init_engine(db_path: Path | str | None = None):
+     global _engine, _SessionFactory
+-    path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
++    path = Path(db_path) if db_path is not None else default_db_path()
+     path.parent.mkdir(parents=True, exist_ok=True)
+     _engine = create_engine(f"sqlite:///{path}", future=True)
+ 
+diff --git a/plc/models.py b/plc/models.py
+index 96b384d..1f5608c 100644
+--- a/plc/models.py
++++ b/plc/models.py
+@@ -25,6 +25,10 @@ class OpcUaConfig(BaseModel):
+     # görünmez/aktif olmaz. Gerçek kamera devreye alındığında kapatılıp
+     # kaldırılabilir olması gerektiğinden ayrı bir mimari parça, tek bayrak.
+     vision_simulator_enabled: bool = False
++    # Ayri surec karari (KARARLAR.md #1): "KAMERA EKRANI" artik sayfa
++    # degistirmiyor, VisionCut'in kendi exe'sini one aliyor/baslatiyor.
++    # Bos birakilirsa buton yalnizca calisan pencereyi one alabilir.
++    vision_exe: str = ""
+     nodes: dict[str, str] = Field(default_factory=dict)
+ 
+     @property
+diff --git a/plc/tag_map.py b/plc/tag_map.py
+index 884dad7..7c50130 100644
+--- a/plc/tag_map.py
++++ b/plc/tag_map.py
+@@ -10,10 +10,13 @@ from __future__ import annotations
+ import json
+ from pathlib import Path
+ 
+-from core.app_paths import app_base_dir
++from app.paths import config_dir
+ from plc.models import OpcUaConfig
+ 
+-DEFAULT_CONFIG_PATH = app_base_dir() / "config" / "opcua.json"
++#: Resolved on each access, not at import: a test that points
++#: BUFERA_CONFIG_DIR somewhere else must be able to do so after import.
++def default_config_path() -> Path:
++    return config_dir() / "opcua.json"
+ 
+ 
+ class TagMapError(RuntimeError):
+@@ -21,9 +24,17 @@ class TagMapError(RuntimeError):
+ 
+ 
+ def load_config(path: Path | str | None = None) -> OpcUaConfig:
+-    config_path = Path(path) if path is not None else DEFAULT_CONFIG_PATH
++    config_path = Path(path) if path is not None else default_config_path()
+     if not config_path.exists():
+-        raise TagMapError(f"OPC UA config not found: {config_path}")
++        # ⚠️ Deliberately NOT an error. A machine that has never been
++        # commissioned has no config file, and refusing to open leaves the
++        # operator with a traceback instead of a screen. An empty config has
++        # no endpoint, so `is_configured` is False and the HMI opens in Demo
++        # mode and says so.
++        #
++        # A file that EXISTS but is malformed still raises: that one somebody
++        # edited, and silently ignoring their mistake would be worse.
++        return OpcUaConfig()
+     try:
+         raw = json.loads(config_path.read_text(encoding="utf-8"))
+     except json.JSONDecodeError as exc:
+@@ -32,7 +43,7 @@ def load_config(path: Path | str | None = None) -> OpcUaConfig:
+ 
+ 
+ def save_config(config: OpcUaConfig, path: Path | str | None = None) -> None:
+-    config_path = Path(path) if path is not None else DEFAULT_CONFIG_PATH
++    config_path = Path(path) if path is not None else default_config_path()
+     # Taşınabilir/paketli bir dağıtımda `config/` klasörü ilk çalıştırmada
+     # hiç yoksa (config dosyası eksikti, Demo moda düşüldü) Ayarlar'dan
+     # "Kaydet" tıklanınca burası olmadan write_text() FileNotFoundError
+diff --git a/services/machine_service.py b/services/machine_service.py
+index 3422cef..599e0ab 100644
+--- a/services/machine_service.py
++++ b/services/machine_service.py
+@@ -331,6 +331,16 @@ class MachineService(QObject):
+     def endpoint(self) -> str:
+         return self._config.endpoint
+ 
++    @property
++    def config(self) -> OpcUaConfig:
++        """The loaded OPC UA config, for callers that need a plain setting.
++
++        Read-only by convention: the UI reads `vision_exe` from here. Writing
++        to the machine's configuration still goes through the settings screen,
++        which validates and saves it.
++        """
++        return self._config
++
+     # -- PLC state ingestion (real mode) -----------------------------------
+ 
+     def _on_connection_state(self, state: str) -> None:
+diff --git a/tests/test_panel_companion.py b/tests/test_panel_companion.py
+new file mode 100644
+index 0000000..d1fe4f6
+--- /dev/null
++++ b/tests/test_panel_companion.py
+@@ -0,0 +1,157 @@
++"""Two programs, one panel: the handover has to actually happen.
++
++KARARLAR.md #1 put VisionCut in its own process. That turned "show the camera
++page" into "put another program's window in front of the operator", and the
++risk moved with it: a button that is wired to nothing looks exactly like a
++button that works, because the page it used to switch to is gone either way.
++
++So these tests do not ask whether `companion.py` can raise a window. They ask
++whether pressing KAMERA EKRANI on the real nav bar reaches it.
++"""
++
++from __future__ import annotations
++
++import json
++
++import pytest
++from PySide6.QtWidgets import QApplication
++
++_app = QApplication.instance() or QApplication([])
++
++from app import companion
++from app.main import MainWindow
++from services.machine_service import MachineService
++
++
++def _window(tmp_path, vision_exe: str = "") -> MainWindow:
++    cfg = tmp_path / "opcua.json"
++    cfg.write_text(json.dumps({"endpoint": "", "vision_exe": vision_exe,
++                               "nodes": {}}), encoding="utf-8")
++    return MainWindow(MachineService(config_path=cfg))
++
++
++# -- the wiring ------------------------------------------------------------
++
++def test_camera_button_hands_over_instead_of_switching_pages(tmp_path, monkeypatch):
++    win = _window(tmp_path, vision_exe=r"C:\Operon\VisionCut\OperonVisionCut.exe")
++    win._navigate("settings")
++    asked: list[str] = []
++    monkeypatch.setattr("app.main.show_vision_screen",
++                        lambda path, *a, **k: asked.append(str(path)) or "raised")
++    monkeypatch.setattr(type(win), "showMinimized", lambda self: None)
++
++    win._nav.button("camera").click()
++
++    assert asked == [r"C:\Operon\VisionCut\OperonVisionCut.exe"], \
++        "KAMERA EKRANI butonu companion'a hiç ulaşmıyor"
++    assert win._stack.currentWidget() is win._settings_page, \
++        "devretme sayfayı değiştirmemeli"
++
++
++def test_the_exe_path_comes_from_the_config(tmp_path, monkeypatch):
++    win = _window(tmp_path, vision_exe=r"D:\baska\yer\OperonVisionCut.exe")
++    seen: list[str] = []
++    monkeypatch.setattr("app.main.show_vision_screen",
++                        lambda path, *a, **k: seen.append(str(path)) or "raised")
++    monkeypatch.setattr(type(win), "showMinimized", lambda self: None)
++
++    win._hand_over_to_vision()
++
++    assert seen == [r"D:\baska\yer\OperonVisionCut.exe"]
++
++
++def test_we_step_aside_only_when_there_is_something_to_reveal(tmp_path, monkeypatch):
++    """Minimising with VisionCut absent strands the operator on the desktop.
++
++    The kiosk has no taskbar: there would be no way back.
++    """
++    win = _window(tmp_path)
++    minimised: list[bool] = []
++    monkeypatch.setattr(type(win), "showMinimized",
++                        lambda self: minimised.append(True))
++
++    monkeypatch.setattr("app.main.show_vision_screen", lambda *a, **k: "missing")
++    assert win._hand_over_to_vision() == "missing"
++    assert minimised == [], "kamera ekranı yokken kendimizi küçültmemeliyiz"
++
++    monkeypatch.setattr("app.main.show_vision_screen", lambda *a, **k: "launched")
++    win._hand_over_to_vision()
++    assert minimised == [True]
++
++
++def test_the_placeholder_camera_page_is_gone(tmp_path):
++    """Ayrı süreçte yer tutucunun karşılığı yok (VisionCut mesaj 08, kusur c)."""
++    win = _window(tmp_path)
++    assert "camera" not in win._pages
++    assert win._stack.currentWidget() is win._machine_page, \
++        "program makine ana sayfasıyla açılmalı"
++    assert not hasattr(__import__("app.main", fromlist=["x"]),
++                       "CameraPlaceholderPage")
++
++
++# -- the mechanism ---------------------------------------------------------
++
++def test_a_running_window_is_raised_not_launched(monkeypatch):
++    raised: list[int] = []
++    monkeypatch.setattr(companion, "_find_window", lambda hint: 4242)
++    monkeypatch.setattr(companion, "_bring_to_front", lambda hwnd: raised.append(hwnd))
++
++    def _explode(*_a, **_k):
++        raise AssertionError("çalışan pencere varken ikinci kopya başlatıldı")
++
++    monkeypatch.setattr(companion.subprocess, "Popen", _explode)
++    assert companion.show_vision_screen(r"C:\yok\OperonVisionCut.exe") == "raised"
++    assert raised == [4242]
++
++
++def test_a_closed_program_is_launched(tmp_path, monkeypatch):
++    exe = tmp_path / "OperonVisionCut.exe"
++    exe.write_bytes(b"")
++    started: list[list[str]] = []
++    monkeypatch.setattr(companion, "_find_window", lambda hint: None)
++    monkeypatch.setattr(companion.subprocess, "Popen",
++                        lambda args, **k: started.append(args))
++
++    assert companion.show_vision_screen(exe) == "launched"
++    assert started == [[str(exe)]]
++
++
++def test_launch_is_detached_so_it_outlives_us(tmp_path, monkeypatch):
++    exe = tmp_path / "OperonVisionCut.exe"
++    exe.write_bytes(b"")
++    seen: dict = {}
++    monkeypatch.setattr(companion, "_find_window", lambda hint: None)
++    monkeypatch.setattr(companion.subprocess, "Popen",
++                        lambda args, **k: seen.update(k))
++
++    companion.show_vision_screen(exe)
++    assert seen.get("creationflags", 0) != 0 or not companion._IS_WINDOWS
++
++
++def test_an_unconfigured_or_missing_exe_says_missing(monkeypatch):
++    monkeypatch.setattr(companion, "_find_window", lambda hint: None)
++    assert companion.show_vision_screen("") == "missing"
++    assert companion.show_vision_screen(r"C:\hicbir\yerde\yok.exe") == "missing"
++
++
++def test_second_copy_knows_it_is_second():
++    """İki kopya iki OPC UA oturumu açar ve aynı etiketlere yazar."""
++    if not companion._IS_WINDOWS:
++        pytest.skip("adlandırılmış mutex yalnız Windows'ta")
++    name = "Local\\BuferaTestSingleInstance"
++    first = companion.SingleInstance(name)
++    try:
++        assert first.is_first is True
++        second = companion.SingleInstance(name)
++        try:
++            assert second.is_first is False
++        finally:
++            second.release()
++    finally:
++        first.release()
++
++
++def test_our_own_title_still_carries_the_agreed_substring():
++    """VisionCut bizi bu alt dizeyle buluyor (mesaj 08.2) - değiştirilemez."""
++    assert companion.OWN_TITLE_HINT == "Makine Ekran"
++    assert companion.VISION_TITLE_HINT == "Operon VisionCut"
+diff --git a/tests/test_tag_map.py b/tests/test_tag_map.py
+index 277df88..c766524 100644
+--- a/tests/test_tag_map.py
++++ b/tests/test_tag_map.py
+@@ -28,10 +28,31 @@ def test_endpoint_present_means_configured():
+     assert OpcUaConfig(endpoint="opc.tcp://192.168.0.2:4840").is_configured is True
+ 
+ 
+-def test_missing_file_raises(tmp_path):
++def test_missing_file_falls_back_to_demo_mode(tmp_path):
++    """A machine that was never commissioned must still open a window.
++
++    This replaces `test_missing_file_raises`. The old behaviour was found on a
++    packaged build on a clean PC: no config file, so the first thing the
++    customer saw was a traceback box and no screen at all. An absent file now
++    means "not commissioned yet" -- an empty config, no endpoint, Demo mode.
++    """
+     missing = tmp_path / "nope.json"
++    config = load_config(missing)
++    assert config.is_configured is False
++    assert config.nodes == {}
++
++
++def test_invalid_json_still_raises(tmp_path):
++    """A file somebody edited and broke is NOT the same as no file.
++
++    Swallowing this one would hide a typo in a real deployment config behind a
++    silent Demo mode, which is how a machine ends up disconnected with nobody
++    knowing why.
++    """
++    broken = tmp_path / "broken.json"
++    broken.write_text("{endpoint: missing quotes}", encoding="utf-8")
+     with pytest.raises(TagMapError):
+-        load_config(missing)
++        load_config(broken)
+ 
+ 
+ def test_invalid_json_raises(tmp_path):
+diff --git a/tests/test_writable_paths.py b/tests/test_writable_paths.py
+new file mode 100644
+index 0000000..b542fc0
+--- /dev/null
++++ b/tests/test_writable_paths.py
+@@ -0,0 +1,73 @@
++"""Config and data must land somewhere writable once the program is packaged.
++
++Both folders used to be derived from `__file__`. In a checkout that is the
++repository, which is writable and already contains `config/`; packaged and
++installed under `Program Files` it is neither. The alarm history and the
++settings store would then fail on the customer's panel while passing every
++test on every development machine -- so these tests pretend to be frozen.
++"""
++
++from __future__ import annotations
++
++import importlib
++
++import pytest
++
++from app import paths
++
++
++@pytest.fixture
++def frozen(monkeypatch):
++    monkeypatch.setattr(paths, "is_frozen", lambda: True)
++    monkeypatch.setenv("ProgramData", r"C:\ProgramData")
++    monkeypatch.delenv("BUFERA_CONFIG_DIR", raising=False)
++    monkeypatch.delenv("BUFERA_DATA_DIR", raising=False)
++
++
++def test_frozen_config_goes_under_programdata(frozen):
++    assert paths.config_dir().as_posix().endswith(
++        "ProgramData/Bufera/MakineEkrani/config")
++
++
++def test_frozen_data_goes_under_programdata(frozen):
++    assert paths.data_dir().as_posix().endswith(
++        "ProgramData/Bufera/MakineEkrani/data")
++
++
++def test_a_checkout_keeps_using_the_repository_folders(monkeypatch):
++    monkeypatch.setattr(paths, "is_frozen", lambda: False)
++    monkeypatch.delenv("BUFERA_CONFIG_DIR", raising=False)
++    assert paths.config_dir().name == "config"
++    assert paths.config_dir().parent.name == "Bufera_MakineEkrani" or \
++        (paths.config_dir().parent / "app").is_dir()
++
++
++def test_environment_overrides_win_in_both_modes(monkeypatch, tmp_path):
++    monkeypatch.setenv("BUFERA_CONFIG_DIR", str(tmp_path / "c"))
++    monkeypatch.setenv("BUFERA_DATA_DIR", str(tmp_path / "d"))
++    for frozen_state in (True, False):
++        monkeypatch.setattr(paths, "is_frozen", lambda: frozen_state)
++        assert paths.config_dir() == tmp_path / "c"
++        assert paths.data_dir() == tmp_path / "d"
++
++
++def test_the_db_and_the_config_follow_those_folders(monkeypatch, tmp_path):
++    monkeypatch.setenv("BUFERA_CONFIG_DIR", str(tmp_path / "c"))
++    monkeypatch.setenv("BUFERA_DATA_DIR", str(tmp_path / "d"))
++    db = importlib.import_module("persistence.db")
++    tag_map = importlib.import_module("plc.tag_map")
++
++    assert db.default_db_path() == tmp_path / "d" / "bufera.db"
++    assert tag_map.default_config_path() == tmp_path / "c" / "opcua.json"
++
++
++def test_saving_creates_the_folder_it_needs(monkeypatch, tmp_path):
++    """First commissioning writes a config where no folder exists yet."""
++    from plc.models import OpcUaConfig
++    from plc.tag_map import load_config, save_config
++
++    target = tmp_path / "hic" / "olmayan" / "opcua.json"
++    save_config(OpcUaConfig(endpoint="opc.tcp://ornek-plc:4840"), target)
++
++    assert target.is_file()
++    assert load_config(target).endpoint == "opc.tcp://ornek-plc:4840"
+-- 
+2.53.0.windows.1
+

@@ -1,0 +1,234 @@
+From 19ac11a497858b9787124d3cd5fb5c0bc46cc84c Mon Sep 17 00:00:00 2001
+From: AI Agent <agent@operon.test>
+Date: Sat, 26 Sep 2026 01:57:00 +0300
+Subject: [PATCH 3/3] VisionCut arizasi aciklamasiyla, Start bekleniyor, tam
+ ekran (mesaj 22 madde 9)
+
+- VisionCut arizasi artik neyin ariza verdigini ve cozumunu gosteriyor
+  (Murat, 2026-09-26: H17 yalniz "Vision uygulamasi ariza bildiriyor"
+  diyordu). durum.json'daki ariza/son_ariza: kamera satirinda kirmizi
+  aciklama + cozum + teknik ayrinti; tabloda Hata/VISION [V<kod>] satiri,
+  arizanin ilk goruldugu saatle. Temizlenince "Son VisionCut arizasi" bir
+  sonraki kesime kadar kalir.
+- [M10] Start bekleniyor: state 20'de canli mesaj.
+- Katalog: M10, U12, V400, V600.
+- app/main.py: pencere tam ekran (showMaximized) aciliyor.
+- tests: 11 (kilit + ariza + M10 + tam ekran); takim 394/394.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ app/main.py                          |  3 +-
+ core/notification_catalog.py         |  4 +++
+ services/vision_feed.py              |  9 ++++-
+ tests/test_notification_catalog.py   |  3 ++
+ tests/test_vision_feed_start_lock.py | 51 ++++++++++++++++++++++++++++
+ ui/machine/machine_page.py           | 37 ++++++++++++++++++++
+ 6 files changed, 105 insertions(+), 2 deletions(-)
+
+diff --git a/app/main.py b/app/main.py
+index 872893a..d304427 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -156,7 +156,8 @@ def main() -> int:
+     service = MachineService()
+ 
+     window = MainWindow(service)
+-    window.show()
++    # 22 §9: her zaman tam ekran açılsın (VisionCut'ın da açılışı böyle).
++    window.showMaximized()
+ 
+     # Started only after the pages exist and have subscribed to the
+     # service's signals, so the very first connectionStateChanged/
+diff --git a/core/notification_catalog.py b/core/notification_catalog.py
+index adfc6ce..48a0920 100644
+--- a/core/notification_catalog.py
++++ b/core/notification_catalog.py
+@@ -121,5 +121,9 @@ NOTIFICATION_CATALOG: tuple[NotificationCatalogEntry, ...] = (
+     NotificationCatalogEntry("M06", SEVERITY_MESSAGE, "\"Başlangıca Dönüş Durduruluyor\" durumunda", "Dönüş durduruluyor; talepleri bırakın."),
+     NotificationCatalogEntry("M07", SEVERITY_MESSAGE, "\"Manuel Hazırlık Bekleniyor\" durumunda", "Manuel modu seçerek hazırlığı yapın."),
+     NotificationCatalogEntry("M08", SEVERITY_MESSAGE, "\"Başlangıç Konumuna Dön\" tamamlanınca", "Başlangıç konumuna dönüş tamamlandı."),
++    NotificationCatalogEntry("M10", SEVERITY_MESSAGE, "\"Perde Bekliyor\" (20) durumunda", "Start bekleniyor: perdeyi yerleştirip START'a basın."),
++    NotificationCatalogEntry("U12", SEVERITY_WARNING, "Çevrim dışında, VisionCut Start'a izin vermiyorken", "Kamera: <VisionCut'ın nedeni> - örn. kesim çizgisi bulunamadı / çerçevenin dışında / VisionCut görüntüsü yok. Yalnız bu ekrandaki START'ı tutar."),
++    NotificationCatalogEntry("V400", SEVERITY_ALARM, "Kesim sırasında (VisionCut arızası)", "Kesim sırasında kamera kesim çizgisini ölçemedi; bıçak körlemesine ilerlemesin diye kesim durduruldu. Çözüm: kumaşı ve ışığı kontrol edin; eksenler başlangıca dönünce yeni kesim başlatılabilir."),
++    NotificationCatalogEntry("V600", SEVERITY_ALARM, "Her an (VisionCut arızası)", "Acil durum aktif. Çözüm: acil stop butonunu ve kapıları kontrol edin, acil durumu çözüp makineyi resetleyin."),
+     NotificationCatalogEntry("M09", SEVERITY_MESSAGE, "\"Durduruluyor\" durumunda", "Otomatik çevrim durduruluyor; mevcut devam yolu bıçak yukarı/eksen dönüşü."),
+ )
+diff --git a/services/vision_feed.py b/services/vision_feed.py
+index cc48015..8c33174 100644
+--- a/services/vision_feed.py
++++ b/services/vision_feed.py
+@@ -44,6 +44,11 @@ class VisionFeedState:
+     cutting: bool            # VisionCut kesimde diyor
+     picture: Path | None     # gösterilecek kare, yoksa None
+     picture_mtime: float     # kare değişti mi diye bakmak için
++    # VisionCut arızası: {"kod", "baslik", "cozum", "ayrinti", "zaman"} ya da
++    # None. `last_fault` arıza temizlendikten sonra da bir sonraki kesime
++    # kadar durur - operatör neyin durdurduğunu sonradan okuyabilsin.
++    fault: dict | None = None
++    last_fault: dict | None = None
+ 
+ 
+ class VisionFeedReader:
+@@ -75,5 +80,7 @@ class VisionFeedReader:
+         allowed = bool(state.get("baslat_izni", False))
+         reason = str(state.get("neden") or ("Kamera onayı var." if allowed
+                                             else "Kamera onayı yok."))
++        fault = state.get("ariza") if isinstance(state.get("ariza"), dict) else None
++        last = state.get("son_ariza") if isinstance(state.get("son_ariza"), dict) else None
+         return VisionFeedState(True, allowed, reason, bool(state.get("kesimde", False)),
+-                               picture, picture_mtime)
++                               picture, picture_mtime, fault, last)
+diff --git a/tests/test_notification_catalog.py b/tests/test_notification_catalog.py
+index 6f11191..53e3cb2 100644
+--- a/tests/test_notification_catalog.py
++++ b/tests/test_notification_catalog.py
+@@ -29,5 +29,8 @@ def test_covers_all_h_u_m_ids_from_the_20260921_task():
+         {f"H{n:02d}" for n in range(1, 23)}
+         | {f"U{n:02d}" for n in range(1, 12)}
+         | {f"M{n:02d}" for n in range(1, 10)}
++        # 2026-09-26 (VisionCut entegrasyonu, mesaj 22 §8-§9): Start bekleniyor,
++        # kamera Start kilidi, VisionCut arızaları.
++        | {"M10", "U12", "V400", "V600"}
+     )
+     assert ids == expected
+diff --git a/tests/test_vision_feed_start_lock.py b/tests/test_vision_feed_start_lock.py
+index fb139fc..098be91 100644
+--- a/tests/test_vision_feed_start_lock.py
++++ b/tests/test_vision_feed_start_lock.py
+@@ -114,3 +114,54 @@ def test_the_page_reads_a_real_file_pair(tmp_path):
+     _emit(page, svc)
+     assert page._start_btn.isEnabled()
+     assert "çerçevede" in page._vision_reason.text()
++
++
++# -- VisionCut arızası burada da açıklanır (Murat, 2026-09-26) -----------------
++
++_FAULT = {"kod": 400, "baslik": "Kesim sırasında kamera kesim çizgisini ölçemedi.",
++          "cozum": "Kumaşı ve ışığı kontrol edin.",
++          "ayrinti": "X=1902.3 mm için tamponlanmış hedef yok",
++          "zaman": "2026-09-26T08:15:00+00:00"}
++
++
++def test_a_vision_fault_is_explained_with_its_remedy(tmp_path):
++    feed = _Feed(allowed=False, reason="VisionCut arızada")
++    feed.state = VisionFeedState(True, False, "VisionCut arızada", False, None, 0.0,
++                                 _FAULT, _FAULT)
++    page, svc = _page(tmp_path, feed)
++    page._poll_vision_feed()
++    _emit(page, svc, cycle_active=True, start_permitted=False)
++
++    label = page._vision_reason.text()
++    assert "VisionCut arızası 400" in label and "Çözüm:" in label and "1902.3" in label
++
++    rows = [(page._alarm_table.item(r, 1).text(), page._alarm_table.item(r, 2).text(),
++             page._alarm_table.item(r, 3).text())
++            for r in range(page._alarm_table.rowCount())]
++    assert any(source == "VISION" and message.startswith("[V400]") for _sev, source, message in rows), rows
++
++
++def test_the_last_fault_stays_readable_after_it_clears(tmp_path):
++    feed = _Feed(allowed=True)
++    feed.state = VisionFeedState(True, True, "Kesim çizgisi çerçevede: +0.4 mm.", False,
++                                 None, 0.0, None, _FAULT)
++    page, _svc = _page(tmp_path, feed)
++    page._poll_vision_feed()
++    assert "Son VisionCut arızası" in page._vision_reason.text()
++    assert not page._live_error_rows, "temizlenmiş arıza hâlâ aktif hata satırı"
++
++
++def test_state_20_says_start_is_awaited(tmp_path):
++    from core.cycle_state import CycleState
++
++    page, svc = _page(tmp_path, _Feed(allowed=True))
++    _emit(page, svc, cycle_state=int(CycleState.WAIT_FOR_MATERIAL))
++    assert any(m.startswith("[M10] Start bekleniyor") for m in page._live_message_texts)
++
++
++def test_the_screen_opens_full_screen():
++    import inspect
++
++    import app.main as main_module
++
++    assert "window.showMaximized()" in inspect.getsource(main_module)
+diff --git a/ui/machine/machine_page.py b/ui/machine/machine_page.py
+index f06fb57..db61c9e 100644
+--- a/ui/machine/machine_page.py
++++ b/ui/machine/machine_page.py
+@@ -154,6 +154,8 @@ def compute_start_inhibit_reasons(
+ # 510 manuel hazırlık,500 otomatik Stop devam yolu". M08 burada YOK - tek
+ # seferlik "yeni sonuç" olduğu için ayrı, geçiş (edge) tabanlı üretilir.
+ _CYCLE_STATE_MESSAGE_MAP: dict[int, str] = {
++    # 22 §9: "state 20'de uygun 'Start bekleniyor' açıklaması".
++    int(CycleState.WAIT_FOR_MATERIAL): "[M10] Start bekleniyor: perdeyi yerleştirip START'a basın.",
+     int(CycleState.WAIT_VISION): "[M01] Kamera verisi bekleniyor.",
+     int(CycleState.WAIT_BLADE_REQUEST): "[M02] Bıçak talebi / geçerli yörünge bekleniyor.",
+     int(CycleState.CLAMP_DOWN): "[M03] Baskı/bıçak aşağı sensörü bekleniyor.",
+@@ -178,6 +180,16 @@ def compute_active_state_message(snap: MachineSnapshot) -> str | None:
+     return _CYCLE_STATE_MESSAGE_MAP.get(snap.cycle_state)
+ 
+ 
++def _clock(stamp: str | None) -> str:
++    """UTC ISO damgasını yerel HH:MM:SS'e çevirir; okunamazsa "ŞİMDİ"."""
++    from datetime import datetime
++
++    try:
++        return datetime.fromisoformat(stamp).astimezone().strftime("%H:%M:%S")
++    except (TypeError, ValueError):
++        return "ŞİMDİ"
++
++
+ class MachinePage(QWidget):
+     def __init__(self, service: MachineService, parent: QWidget | None = None,
+                  vision_feed: VisionFeedReader | None = None):
+@@ -201,6 +213,10 @@ class MachinePage(QWidget):
+         # status() İLK KEZ "done" olduğu tick'te bir kez gösterilir (aynı
+         # durum sonraki tick'lerde sürse bile tekrar eklenmez).
+         self._live_message_texts: list[str] = []
++        # VisionCut arızası (kod + açıklama + çözüm), durum dosyasından. H17
++        # yalnız "Vision uygulaması arıza bildiriyor" diyordu; neyin arıza
++        # verdiği görülemiyordu (Murat, 2026-09-26). (saat, metin)
++        self._live_error_rows: list[tuple[str, str]] = []
+         self._move_to_start_was_done = False
+         self._build_ui()
+ 
+@@ -335,9 +351,27 @@ class MachinePage(QWidget):
+             self._vision_picture.setText("VisionCut görüntüsü yok")
+         colour = COLORS["success"] if state.allowed else COLORS["warning"]
+         text = ("Kamera: " + state.reason) if not state.cutting else "Kamera: kesim sürüyor."
++        if state.fault:
++            colour = COLORS["danger"]
++            text = (f"VisionCut arızası {state.fault.get('kod')}: {state.fault.get('baslik', '')}\n"
++                    f"Çözüm: {state.fault.get('cozum', '')}")
++            if state.fault.get("ayrinti"):
++                text += f"\n({state.fault['ayrinti']})"
++        elif state.last_fault:
++            text = (f"Son VisionCut arızası ({_clock(state.last_fault.get('zaman'))}): "
++                    f"{state.last_fault.get('baslik', '')}\n" + text)
+         if self._vision_reason.text() != text:
+             self._vision_reason.setText(text)
+             self._vision_reason.setStyleSheet(f"color: {colour};")
++
++        rows = []
++        if state.fault:
++            rows.append((_clock(state.fault.get("zaman")),
++                         f"[V{state.fault.get('kod')}] VisionCut: {state.fault.get('baslik', '')} "
++                         f"Çözüm: {state.fault.get('cozum', '')}"))
++        if rows != self._live_error_rows:
++            self._live_error_rows = rows
++            self._refresh_alarm_table()
+         self._apply_start_enable()
+ 
+     def _build_alarm_panel(self) -> QFrame:
+@@ -393,6 +427,9 @@ class MachinePage(QWidget):
+         # göster. Bunlar `AlarmRepository`'de KAYITLI DEĞİL - "ŞİMDİ" ile
+         # işaretlenir (gerçek bir olay zaman damgası değil, canlı durumdur),
+         # Reset'ten etkilenmez, koşul geçince satır anında kaybolur.
++        if SEVERITY_ALARM in selected:
++            for occurred, message in self._live_error_rows:
++                rows.append((occurred, SEVERITY_ALARM, "VISION", message))
+         if SEVERITY_WARNING in selected:
+             for message in self._live_warning_messages:
+                 rows.append(("ŞİMDİ", SEVERITY_WARNING, "PLC", message))
+-- 
+2.53.0.windows.1
+
