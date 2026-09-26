@@ -1,0 +1,2 @@
+# Yamalar git am ile uygulanir; satir sonlari degistirilmemeli.
+*.patch -text
